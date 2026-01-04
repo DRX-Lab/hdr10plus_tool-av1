@@ -945,6 +945,270 @@ def cmd_inject(inp: str, json_path: str, outp: str) -> None:
 
     progress_done()
 
+# ----------------------------
+# PQ helpers (ST 2084)
+# ----------------------------
+_PQ_M1 = 2610.0 / 16384.0
+_PQ_M2 = 2523.0 / 32.0
+_PQ_C1 = 3424.0 / 4096.0
+_PQ_C2 = 2413.0 / 128.0
+_PQ_C3 = 2392.0 / 128.0
+
+
+def nits_to_pq(nits: float) -> float:
+    if nits <= 0.0:
+        return 0.0
+    n = min(max(nits / 10000.0, 0.0), 1.0)
+    n_m1 = n ** _PQ_M1
+    num = _PQ_C1 + _PQ_C2 * n_m1
+    den = 1.0 + _PQ_C3 * n_m1
+    e = (num / den) ** _PQ_M2
+    return float(min(max(e, 0.0), 1.0))
+
+
+def pq_to_nits(pq: float) -> float:
+    e = min(max(pq, 0.0), 1.0)
+    e_1_m2 = e ** (1.0 / _PQ_M2)
+    num = max(e_1_m2 - _PQ_C1, 0.0)
+    den = _PQ_C2 - _PQ_C3 * e_1_m2
+    if den <= 0.0:
+        return 10000.0
+    n = (num / den) ** (1.0 / _PQ_M1)
+    return float(min(max(n * 10000.0, 0.0), 10000.0))
+
+
+def _safe_float(x, default=0.0) -> float:
+    try:
+        if x is None:
+            return float(default)
+        return float(x)
+    except Exception:
+        return float(default)
+
+
+def _safe_max3(x, default=0.0) -> float:
+    if x is None:
+        return float(default)
+    if isinstance(x, (int, float)):
+        return float(x)
+    if isinstance(x, (list, tuple)):
+        vals = []
+        for v in x:
+            try:
+                vals.append(float(v))
+            except Exception:
+                pass
+        return float(max(vals)) if vals else float(default)
+    return float(default)
+
+
+def _infer_scale_from_scene(scene_entry: dict) -> float:
+    """
+    Infer likely unit scale for classic JSON luminance integers.
+    Returns a divisor such that: nits = raw / scale.
+
+    Heuristic (pragmatic):
+      - If values (hist/maxscl) are in the ~0..5000 range, most commonly they are 0.1 nit units => scale=10.
+      - If values are much larger, some pipelines store ~1/32 nit units => scale=32.
+      - If TargetedSystemDisplayMaximumLuminance is present, prefer the scale that makes peaks reasonable
+        relative to that display max.
+    """
+    try:
+        if not isinstance(scene_entry, dict):
+            return 10.0
+
+        tmax = _safe_float(scene_entry.get("TargetedSystemDisplayMaximumLuminance", 0.0), 0.0)
+
+        lum = scene_entry.get("LuminanceParameters", {}) or {}
+        if not isinstance(lum, dict):
+            return 10.0
+
+        mx_raw = _safe_max3(lum.get("MaxScl", [0, 0, 0]), 0.0)
+
+        dist = lum.get("LuminanceDistributions", {}) or {}
+        dv = dist.get("DistributionValues", None)
+        peak_raw = None
+        if isinstance(dv, list) and dv:
+            try:
+                peak_raw = float(max(dv))
+            except Exception:
+                peak_raw = None
+
+        if peak_raw is None:
+            peak_raw = mx_raw
+
+        if peak_raw <= 5000.0:
+            if tmax > 0.0:
+                peak10 = peak_raw / 10.0
+                peak32 = peak_raw / 32.0
+                score10 = abs(peak10 - tmax)
+                score32 = abs(peak32 - tmax)
+                if score10 <= score32 * 0.85:
+                    return 10.0
+            return 10.0
+
+        return 32.0
+    except Exception:
+        return 10.0
+
+
+def plot_hdr10plus_style_png(path_png: str, j: dict, json_name: str) -> None:
+    """
+    Rust/plotters-like design:
+      - PQ Y-axis (0..1) with key-point ticks labeled in nits
+      - Two filled area series: Maximum + Average
+      - Big canvas (3000x1200), margins, mesh, legend lower-left
+      - Captions at top-left ordered like reference image
+    Notes:
+      - Peak brightness should come from histogram maximum (DistributionValues) when available.
+      - Luminance integers in classic JSON are NOT guaranteed to be in nits; we infer a scale.
+    """
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except Exception as e:
+        raise SystemExit(f"ERROR: matplotlib import failed: {type(e).__name__}: {e}") from e
+
+    si = (j or {}).get("SceneInfo", []) or []
+    n = len(si)
+    if n <= 0:
+        raise SystemExit("ERROR: SceneInfo is empty; cannot plot.")
+
+    # Infer scale from first scene (nits = raw / SCALE)
+    SCALE = _infer_scale_from_scene(si[0] if si else {})
+
+    # Match Rust example colors
+    MAXSCL_COLOR = (65/255.0, 105/255.0, 225/255.0)  # royalblue
+    AVERAGE_COLOR = (75/255.0, 0/255.0, 130/255.0)   # indigo
+
+    max_pq = []
+    avg_pq = []
+    missing = 0
+    invalid = 0
+    floor_pq = nits_to_pq(0.01)
+
+    used_histogram_peak = False
+
+    for e in si:
+        if not isinstance(e, dict):
+            missing += 1
+            max_pq.append(floor_pq)
+            avg_pq.append(floor_pq)
+            continue
+
+        lum = e.get("LuminanceParameters", {}) or {}
+        if not isinstance(lum, dict):
+            invalid += 1
+            max_pq.append(floor_pq)
+            avg_pq.append(floor_pq)
+            continue
+
+        # AverageRGB (raw -> nits)
+        avg_raw = _safe_float(lum.get("AverageRGB", 0.0), 0.0)
+        avg_nits = avg_raw / SCALE
+
+        # Peak brightness: histogram maximum value when available
+        dist = lum.get("LuminanceDistributions", {}) or {}
+        dv = dist.get("DistributionValues", None)
+
+        peak_raw = None
+        if isinstance(dv, list) and len(dv) > 0:
+            try:
+                peak_raw = float(max(dv))
+            except Exception:
+                peak_raw = None
+
+        if peak_raw is not None:
+            mx_nits = peak_raw / SCALE
+            used_histogram_peak = True
+        else:
+            # Fallback: MaxScl (raw -> nits)
+            mx_raw = _safe_max3(lum.get("MaxScl", [0, 0, 0]), 0.0)
+            mx_nits = mx_raw / SCALE
+
+        # Clamp to HDR range
+        avg_nits = max(0.0, min(10000.0, avg_nits))
+        mx_nits = max(0.0, min(10000.0, mx_nits))
+
+        avg_pq.append(max(floor_pq, nits_to_pq(avg_nits)))
+        max_pq.append(max(floor_pq, nits_to_pq(mx_nits)))
+
+    # Stats in nits (ignore placeholders)
+    valid_max_nits = [pq_to_nits(v) for v in max_pq if v > nits_to_pq(0.02)]
+    valid_avg_nits = [pq_to_nits(v) for v in avg_pq if v > nits_to_pq(0.02)]
+
+    maxcll = max(valid_max_nits) if valid_max_nits else 0.01
+    maxcll_avg = (sum(valid_max_nits) / len(valid_max_nits)) if valid_max_nits else 0.01
+    maxfall = max(valid_avg_nits) if valid_avg_nits else 0.01
+    maxfall_avg = (sum(valid_avg_nits) / len(valid_avg_nits)) if valid_avg_nits else 0.01
+
+    x = list(range(n))
+
+    # 3000x1200
+    fig = plt.figure(figsize=(30.0, 12.0), dpi=100)
+    ax = fig.add_subplot(111)
+
+    ax.set_title("HDR10+ Plot", fontsize=22, pad=24)
+
+    ax.set_ylim(0.0, 1.0)
+    ax.set_xlabel("frames", fontsize=14)
+    ax.set_ylabel("nits (cd/m²)", fontsize=14)
+
+    ax.grid(True, which="major", alpha=0.10, linewidth=1.2)
+    ax.grid(True, which="minor", alpha=0.03, linewidth=0.8)
+    ax.minorticks_on()
+
+    key_nits = [
+        0.01, 0.1, 0.5, 1.0, 2.5, 5.0, 10.0, 25.0, 50.0, 100.0,
+        200.0, 400.0, 600.0, 1000.0, 2000.0, 4000.0, 10000.0
+    ]
+    key_pq = [nits_to_pq(v) for v in key_nits]
+    ax.set_yticks(key_pq)
+    ax.set_yticklabels([("{:.3f}".format(v)).rstrip("0").rstrip(".") for v in key_nits], fontsize=11)
+
+    max_label = f"Maximum (MaxCLL: {maxcll:.2f} nits, avg: {maxcll_avg:.2f} nits)"
+    avg_label = f"Average (MaxFALL: {maxfall:.2f} nits, avg: {maxfall_avg:.2f} nits)"
+
+    ax.fill_between(x, max_pq, 0.0, alpha=0.25, linewidth=0.0, color=MAXSCL_COLOR)
+    ax.plot(x, max_pq, linewidth=1.5, color=MAXSCL_COLOR, label=max_label)
+
+    ax.fill_between(x, avg_pq, 0.0, alpha=0.50, linewidth=0.0, color=AVERAGE_COLOR)
+    ax.plot(x, avg_pq, linewidth=1.5, color=AVERAGE_COLOR, label=avg_label)
+
+    leg = ax.legend(loc="lower left", framealpha=1.0, fontsize=12)
+    leg.get_frame().set_linewidth(1.0)
+
+    # ---- Captions ordered like your reference image ----
+    profile = ((j.get("JSONInfo", {}) or {}).get("HDR10plusProfile", "?"))
+    scenes = None
+    summary = j.get("SceneInfoSummary", {}) or {}
+    scene_counts = summary.get("SceneFrameNumbers", None)
+    if isinstance(scene_counts, list):
+        scenes = len(scene_counts)
+
+    peak_source = "Histogram maximum value" if used_histogram_peak else "MaxScl (fallback)"
+
+    left_lines = [
+        f"{json_name}",
+        f"Frames: {n}. Profile {profile}." + (f" Scenes: {scenes}." if scenes is not None else ""),
+        f"Peak brightness source: {peak_source}",
+        f"Inferred scale: {SCALE:g} units -> 1 nit",
+    ]
+
+    x0 = 0.06
+    y0 = 0.945
+    line_h = 0.022
+
+    for i, line in enumerate(left_lines):
+        fig.text(x0, y0 - i * line_h, line, fontsize=12, ha="left", va="top")
+
+    # Reserve top area for title + captions (like reference)
+    fig.subplots_adjust(left=0.06, right=0.99, top=0.86, bottom=0.10)
+
+    fig.savefig(path_png)
+    plt.close(fig)
+
 
 def cmd_plot(inp_json: str, out_png: str) -> None:
     """
@@ -953,34 +1217,23 @@ def cmd_plot(inp_json: str, out_png: str) -> None:
     j = load_json_file(inp_json)
     validate_classic_json(j)
 
-    si = j["SceneInfo"]
-    n = len(si)
-    if n == 0:
-        raise ValueError("SceneInfo is empty")
+    si = (j.get("SceneInfo", []) or [])
+    total = len(si) if si else 1
 
-    # Collect series
-    x = [e.get("SequenceFrameIndex", i) for i, e in enumerate(si)]
-    tsdml = [e.get("TargetedSystemDisplayMaximumLuminance", 0) for e in si]
-    avg = [e.get("LuminanceParameters", {}).get("AverageRGB", 0) for e in si]
-    maxscl_max = [max(e.get("LuminanceParameters", {}).get("MaxScl", [0, 0, 0])) for e in si]
+    # 0..50% during "scan"
+    last = -1.0
+    for i in range(total):
+        pct = (i + 1) * 50.0 / total
+        if pct - last >= 0.1 or pct >= 50.0:
+            progress_bar(pct)
+            last = pct
 
-    # Bar only
-    for i in range(n):
-        progress_bar(((i + 1) / n) * 100.0)
+    import os
+    plot_hdr10plus_style_png(out_png, j, os.path.basename(inp_json))
+
+    progress_bar(100.0)
     progress_done()
 
-    import matplotlib.pyplot as plt
-
-    plt.figure()
-    plt.plot(x, tsdml, label="TargetedSystemDisplayMaximumLuminance")
-    plt.plot(x, avg, label="AverageRGB")
-    plt.plot(x, maxscl_max, label="Max(MaxScl)")
-    plt.legend()
-    plt.xlabel("Frame")
-    plt.ylabel("Value")
-    plt.tight_layout()
-    plt.savefig(out_png, dpi=150)
-    plt.close()
 
 
 # ----------------------------
